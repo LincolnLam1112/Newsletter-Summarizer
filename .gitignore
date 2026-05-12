@@ -1,0 +1,7 @@
+# credentials / secrets
+.codex
+.env
+*.pem
+*.key
+credentials.json example.txt
+secrets.toml

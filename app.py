@@ -11,6 +11,7 @@ User Input -> Content Retrieval -> Preprocessing -> TF-IDF/Keyword Filtering
 
 from __future__ import annotations
 
+
 import html
 import re
 import textwrap
@@ -23,21 +24,29 @@ from typing import Iterable, List, Sequence, Tuple
 
 import streamlit as st
 
+from datetime import datetime
+from email.utils import parsedate_to_datetime
+
+import os
+
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import pickle
+
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 # Bing works better than Google News here because the RSS links expose publisher URLs
 BING_NEWS_RSS = "https://www.bing.com/news/search?q={query}&format=rss"
 
-
 @dataclass
 class Article:
-    """Small in-memory representation of a fetched RSS item."""
-
-    # keeping article data together makes the pipeline easier to pass around
     title: str
     source: str
     link: str
     text: str
     score: float = 0.0
+    published: datetime | None = None
 
 
 MIN_FULL_ARTICLE_WORDS = 80
@@ -221,6 +230,13 @@ def fetch_feed_with_feedparser(url: str) -> List[Article]:
         rss_text = clean_text(f"{summary} {content}") or title
         # try full article content first, then use the RSS snippet if needed
         text = choose_article_text(link, rss_text)
+        
+        published_dt = None
+        if hasattr(entry, "published_parsed") and entry.published_parsed:
+            published_dt = datetime(*entry.published_parsed[:6])
+        elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
+            published_dt = datetime(*entry.updated_parsed[:6])
+        
         if text:
             articles.append(
                 Article(
@@ -228,6 +244,7 @@ def fetch_feed_with_feedparser(url: str) -> List[Article]:
                     source=source,
                     link=link,
                     text=text,
+                    published=published_dt,
                 )
             )
     return articles
@@ -254,10 +271,29 @@ def fetch_feed_with_stdlib(url: str) -> List[Article]:
         rss_text = clean_text(description) or title
         # same full-text-first approach as the feedparser path
         text = choose_article_text(link, rss_text)
+        
+        date_str = item.findtext("pubDate")
+        published_dt = None
+        if date_str:
+            try:
+                published_dt = parsedate_to_datetime(date_str)
+            except Exception:
+                pass
+        
         if text:
-            articles.append(Article(title=title, source=channel_title, link=link, text=text))
+            articles.append(Article(title=title, source=channel_title, link=link, text=text, published=published_dt))
 
     return articles
+
+
+def filter_articles_by_date(articles, start_date):
+    if start_date is None:
+        return list(articles)
+
+    return [
+        a for a in articles
+        if a.published and a.published >= start_date
+    ]
 
 
 # fetch all feeds and keep errors instead of crashing the app
@@ -304,6 +340,7 @@ def rank_with_tfidf(articles: Sequence[Article], keywords: Sequence[str]) -> Lis
                 article.link,
                 article.text,
                 keyword_score(f"{article.title} {article.text}", keywords),
+                article.published,
             )
             for article in articles
         ]
@@ -318,10 +355,25 @@ def rank_with_tfidf(articles: Sequence[Article], keywords: Sequence[str]) -> Lis
     scores = cosine_similarity(matrix[0:1], matrix[1:]).flatten()
 
     ranked = [
-        Article(article.title, article.source, article.link, article.text, float(score))
-        for article, score in zip(articles, scores)
-    ]
-    return sorted(ranked, key=lambda article: article.score, reverse=True)
+            Article(
+                article.title,
+                article.source,
+                article.link,
+                article.text,
+                float(score),
+                article.published  # ✅ KEEP THE DATE
+            )
+            for article, score in zip(articles, scores)
+        ]
+    
+    toReturn = sorted(ranked, key=lambda article: article.score, reverse=True)
+    
+    for article in ranked:
+        print(article.title, article.score)
+    
+    print()
+    
+    return toReturn
 
 
 # keep only the articles that look most relevant to the user's topics
@@ -369,13 +421,32 @@ def build_context(articles: Sequence[Article], max_chars: int = 12000) -> str:
 def load_summarizer():
     """Load a small transformer summarizer if HuggingFace is available."""
     try:
-        from transformers import pipeline  # type: ignore
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-        # distilBART is smaller than full BART, so it is more realistic for local demos
-        return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-    except Exception:
-        # if transformers/model download fails, the app falls back to extractive summaries
+        model_name = "sshleifer/distilbart-cnn-12-6"
+        # model_name = "google/flan-t5-base"
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+        return tokenizer, model
+
+    except Exception as e:
+        st.error(f"Summarizer load failed: {e}")
         return None
+
+# # load the HuggingFace summarizer once so it is not reloaded on every click
+# @st.cache_resource(show_spinner=False)
+# def load_summarizer():
+#     """Load a small transformer summarizer if HuggingFace is available."""
+#     try:
+#         from transformers import pipeline  # type: ignore
+
+#         # distilBART is smaller than full BART, so it is more realistic for local demos
+#         return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+#     except Exception:
+#         # if transformers/model download fails, the app falls back to extractive summaries
+#         return None
 
 
 # backup summarizer when transformers or the model are not available
@@ -457,11 +528,19 @@ def summarize_article(article: Article, keywords: Sequence[str]) -> str:
 
 
 # generate the final briefing, using BART first and fallback logic if needed
-def summarize_context(text: str, keywords: Sequence[str], target_minutes: int) -> Tuple[str, str]:
+def summarize_context(text: str,
+                    keywords: Sequence[str],
+                    target_minutes: int,
+                    use_transformer: bool = True
+                    ) -> Tuple[str, str]:
     """Generate a concise summary and report which summarization method was used."""
     if not text.strip():
         return "", "No content"
-
+    
+    if not use_transformer:
+        fallback = extractive_summary(text, keywords, max_sentences=6)
+        return textwrap.shorten(fallback, width=1200, placeholder="..."), "Extractive (manual toggle)"
+    
     # Scale every path, including fallback, so the slider is visible in the UI.
     (
         min_summary_length,
@@ -472,38 +551,112 @@ def summarize_context(text: str, keywords: Sequence[str], target_minutes: int) -
     ) = summary_length_settings(target_minutes)
 
     if word_count(text) < 90 or len(split_sentences(text)) < 3:
+        
+        print(word_count(text), len(split_sentences(text)))
+        print(text)
+        print()
+        
         # do not force BART to summarize tiny RSS-like input
         cleaned = extractive_summary(text, keywords, max_sentences=fallback_sentence_count)
-        return textwrap.shorten(cleaned, width=fallback_char_limit, placeholder="..."), "Cleaned RSS summary"
-
+        return textwrap.shorten(cleaned, width=fallback_char_limit, placeholder="..."), "Extractive summary"
+    
     summarizer = load_summarizer()
 
     if summarizer is None:
         # fallback if model loading fails so the app still returns something useful
-        fallback = extractive_summary(text, keywords, max_sentences=fallback_sentence_count)
-        return textwrap.shorten(fallback, width=fallback_char_limit, placeholder="..."), "Extractive fallback"
-
+        fallback = extractive_summary(
+            text,
+            keywords,
+            max_sentences=fallback_sentence_count
+        )
+    
+        return (
+            textwrap.shorten(
+                fallback,
+                width=fallback_char_limit,
+                placeholder="..."
+            ),
+            "Extractive fallback-1"
+        )
+    
     try:
         # Longer targets get more source context, but we still stay under BART's limits.
-        limited_text = text[:context_char_limit]
-        result = summarizer(
+        limited_text = remove_boilerplate(text)[:context_char_limit]
+    
+        tokenizer, model = summarizer
+    
+        inputs = tokenizer(
             limited_text,
-            max_length=max_summary_length,
-            min_length=min_summary_length,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1024
+        )
+    
+        summary_ids = model.generate(
+            inputs["input_ids"],
+            max_new_tokens=max_summary_length,
+            min_new_tokens=min_summary_length,
             do_sample=False,
-            # beam search makes the output more stable than sampling for this use case
             num_beams=4,
-            # these help reduce title/snippet repetition
             no_repeat_ngram_size=3,
             repetition_penalty=1.15,
             length_penalty=1.0,
-            truncation=True,
         )
-        return result[0]["summary_text"].strip(), "HuggingFace BART"
-    except Exception:
-        # fallback if the model errors during generation
-        fallback = extractive_summary(text, keywords, max_sentences=fallback_sentence_count)
-        return textwrap.shorten(fallback, width=fallback_char_limit, placeholder="..."), "Extractive fallback"
+    
+        summary = tokenizer.decode(
+            summary_ids[0],
+            skip_special_tokens=True
+        )
+    
+        return summary.strip(), "HuggingFace BART"
+    
+    except Exception as e:
+        st.error(f"Summarization failed: {e}")
+    
+        fallback = extractive_summary(
+            text,
+            keywords,
+            max_sentences=fallback_sentence_count
+        )
+    
+        return (
+            textwrap.shorten(
+                fallback,
+                width=fallback_char_limit,
+                placeholder="..."
+            ),
+            "Extractive fallback-2"
+        )
+    
+    
+    # summarizer = load_summarizer()
+
+    # if summarizer is None:
+    #     # fallback if model loading fails so the app still returns something useful
+    #     fallback = extractive_summary(text, keywords, max_sentences=fallback_sentence_count)
+    #     return textwrap.shorten(fallback, width=fallback_char_limit, placeholder="..."), "Extractive fallback"
+
+    # try:
+    #     # Longer targets get more source context, but we still stay under BART's limits.
+    #     limited_text = text[:context_char_limit]
+    #     result = summarizer(
+    #         limited_text,
+    #         max_length=max_summary_length,
+    #         min_length=min_summary_length,
+    #         do_sample=False,
+    #         # beam search makes the output more stable than sampling for this use case
+    #         num_beams=4,
+    #         # these help reduce title/snippet repetition
+    #         no_repeat_ngram_size=3,
+    #         repetition_penalty=1.15,
+    #         length_penalty=1.0,
+    #         truncation=True,
+    #     )
+    #     return result[0]["summary_text"].strip(), "HuggingFace BART"
+    # except Exception:
+    #     # fallback if the model errors during generation
+    #     fallback = extractive_summary(text, keywords, max_sentences=fallback_sentence_count)
+    #     return textwrap.shorten(fallback, width=fallback_char_limit, placeholder="..."), "Extractive fallback"
 
 
 # show the source articles so the summary does not feel like a black box
@@ -513,11 +666,25 @@ def render_article_list(articles: Iterable[Article], keywords: Sequence[str]) ->
         # simple list reads better here than a bunch of empty-feeling dropdowns
         st.markdown(f"**{article.title}**")
         st.write(summarize_article(article, keywords))
-        st.caption(f"{article.source} | Relevance score: {article.score:.3f}")
+        date_str = article.published.strftime("%Y-%m-%d %H:%M") if article.published else "Unknown date"
+        st.caption(f"{article.source} | {date_str} | Relevance score: {article.score:.3f}")
+        #st.caption(f"{article.source} | Relevance score: {article.score:.3f}")
         if article.link:
             st.link_button("Open source", article.link)
         st.divider()
 
+
+def remove_boilerplate(text: str) -> str:
+    bad_phrases = [
+        "back to mail",
+        "back to the page",
+        "share this article",
+        "follow us",
+    ]
+    for phrase in bad_phrases:
+        text = re.sub(phrase + r".*", "", text, flags=re.IGNORECASE)
+
+    return text
 
 # main Streamlit UI and app flow
 def main() -> None:
@@ -528,16 +695,44 @@ def main() -> None:
     st.caption("MVP prototype: topic filtering plus AI-generated briefing from RSS/newsletter sources.")
 
     with st.sidebar:
-        st.header("Sources")
-        st.write("Sources are generated from your topics using news RSS search.")
-        # custom feeds are useful for demos if a news source blocks scraping
-        custom_feeds = st.text_area(
-            "Optional extra RSS URLs",
-            placeholder="https://example.com/feed.xml\nhttps://another-site.com/rss",
-            height=100,
-        )
+        st.header("Summarization")
         max_articles = st.slider("Articles to summarize", min_value=3, max_value=12, value=6)
         target_minutes = st.slider("Summary length target", min_value=5, max_value=10, value=7)
+        start_date_input = st.date_input(
+            "Only include articles from",
+            value=None,
+            help="Filter out older articles",
+        )
+        
+        use_transformer = st.checkbox(
+        "Use AI summarizer (slower, better quality)",
+        value=True
+        )
+        
+        
+        st.header("Sources")
+
+        #gmail_enabled = st.checkbox("Enable Gmail")
+        source_mode = st.radio(
+            "Source mode",
+            ["RSS + Gmail", "RSS only", "Gmail only"],
+            index=0
+        )
+        gmail_enabled = source_mode in ["RSS + Gmail", "Gmail only"]
+        rss_enabled = source_mode in ["RSS + Gmail", "RSS only"]
+        
+        gmail_limit = st.slider("Emails to include", 3, 50, 10)
+        
+        custom_feeds = st.text_area(
+            "Optional Extra RSS URLs",
+            placeholder="https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+            height=100,
+        )
+        
+        st.write("By default only the Bing news RSS is searched, but above you can add more.")
+        # "https://www.bing.com/news/search?q={query}&format=rss"
+        
+        
 
     topics = st.text_input(
         "Topics or keywords",
@@ -558,15 +753,34 @@ def main() -> None:
             st.error("Enter a searchable topic or add a custom RSS URL.")
             return
 
-        with st.spinner("Fetching topic-specific newsletter/news items..."):
-            # cached for a bit so repeated clicks do not refetch every article
-            articles, errors = fetch_articles(tuple(feed_urls))
+        with st.spinner("Searching..."):
+            articles = []
+            errors = []
+            
+            if rss_enabled:
+                with st.spinner("Fetching RSS feeds..."):
+                    rss_articles, errors = fetch_articles(tuple(feed_urls))
+                    articles.extend(rss_articles)
+            
+            if gmail_enabled:
+                with st.spinner("Fetching Gmail..."):
+                    try:
+                        gmail_articles = safe_fetch_gmail(gmail_limit)
+                        articles.extend(gmail_articles)
+                    except Exception as e:
+                        st.warning(f"Gmail failed: {e}")
 
         if errors:
             with st.expander("Some feeds could not be fetched"):
                 for error in errors:
                     st.warning(error)
-
+        
+        start_datetime = None
+        if start_date_input:
+            start_datetime = datetime.combine(start_date_input, datetime.min.time())
+        
+        articles = filter_articles_by_date(articles, start_datetime)
+        
         if not articles:
             st.error("No articles were fetched. Try different sources or a custom RSS feed.")
             return
@@ -581,7 +795,7 @@ def main() -> None:
 
         with st.spinner("Generating summary..."):
             # one combined briefing across the selected relevant articles
-            summary, method = summarize_context(context, keywords, target_minutes)
+            summary, method = summarize_context(context, keywords, target_minutes, use_transformer)
 
         if not summary:
             st.error("Relevant content was found, but the app could not generate a summary.")
@@ -596,6 +810,130 @@ def main() -> None:
     else:
         st.info("Enter topics, choose sources, and generate a concise newsletter briefing.")
 
+
+def get_gmail_service():
+    creds = None
+
+    if os.path.exists("token.pickle"):
+        with open("token.pickle", "rb") as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                os.path.join(os.path.dirname(__file__), "credentials.json"),
+                GMAIL_SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        with open("token.pickle", "wb") as token:
+            pickle.dump(creds, token)
+
+    return build("gmail", "v1", credentials=creds)
+
+
+def safe_fetch_gmail(max_results=10):
+    try:
+        return fetch_gmail_articles(max_results=10)
+    except FileNotFoundError:
+        st.warning("Gmail not configured (missing credentials.json)")
+        return []
+    except Exception as e:
+        st.warning(f"Gmail error: {e}")
+        return []
+
+def fetch_gmail_articles(max_results=10) -> List[Article]:
+    service = get_gmail_service()
+
+    results = service.users().messages().list(
+        userId="me",
+        maxResults=max_results,
+        q="newer_than:7d"
+    ).execute()
+
+    messages = results.get("messages", [])
+
+    articles = []
+
+    for msg in messages:
+        msg_data = service.users().messages().get(
+            userId="me",
+            id=msg["id"],
+            format="full"
+        ).execute()
+
+        headers = msg_data["payload"].get("headers", [])
+
+        subject = next((h["value"] for h in headers if h["name"] == "Subject"), "No Subject")
+        sender = next((h["value"] for h in headers if h["name"] == "From"), "Unknown")
+
+        #text = msg_data.get("snippet", "")
+        text = extract_email_body(msg_data["payload"])[:8000]
+        
+        # Gmail timestamp
+        timestamp = int(msg_data["internalDate"]) / 1000
+        published = datetime.fromtimestamp(timestamp)
+
+        articles.append(
+            Article(
+                title=subject,
+                source=sender,
+                link="https://mail.google.com/",
+                text=text,
+                published=published,
+            )
+        )
+
+    return articles
+
+import base64
+from bs4 import BeautifulSoup
+
+
+def extract_email_body(payload):
+    """
+    Recursively extract the best readable body from Gmail payloads.
+    """
+
+    if "parts" in payload:
+        for part in payload["parts"]:
+            mime_type = part.get("mimeType", "")
+
+            # Prefer plain text
+            if mime_type == "text/plain":
+                data = part["body"].get("data")
+                if data:
+                    decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                    return clean_text(decoded)
+
+        for part in payload["parts"]:
+            mime_type = part.get("mimeType", "")
+
+            # Fallback to HTML
+            if mime_type == "text/html":
+                data = part["body"].get("data")
+                if data:
+                    html_text = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                    soup = BeautifulSoup(html_text, "html.parser")
+                    return clean_text(soup.get_text(" "))
+
+        # recurse into nested multipart sections
+        for part in payload["parts"]:
+            result = extract_email_body(part)
+            if result:
+                return result
+
+    # Single-part emails
+    body = payload.get("body", {})
+    data = body.get("data")
+
+    if data:
+        decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        return clean_text(decoded)
+
+    return ""
 
 if __name__ == "__main__":
     main()

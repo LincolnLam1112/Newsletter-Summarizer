@@ -1,0 +1,11 @@
+streamlit
+feedparser
+beautifulsoup4
+scikit-learn
+transformers
+torch
+newspaper3k
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
